@@ -25,13 +25,13 @@ pigz_container = 'shub://TomHarrop/singularity-containers:pigz_2.4.0'
 # MAIN #
 ########
 
-all_indivs = sorted(set(glob_wildcards("data/raw/{indiv}/{indiv1}_R1.fq.gz").indiv))
+all_indivs = sorted(set(
+    glob_wildcards("data/raw/{indiv}/{indiv1}_R1.fq.gz").indiv))
 
 
 #########
 # RULES #
 #########
-
 
 rule target:
     input:
@@ -74,7 +74,6 @@ rule freebayes:
         '> {output} '
         '2> {log}'
 
-
 rule index_bamfile:
     input:
         'output/030_process-aln/{indiv}_marked.bam'
@@ -88,7 +87,6 @@ rule index_bamfile:
         samtools_container
     shell:
         'samtools index -@ {threads} {input} 2> {log}'
-
 
 rule markdup:
     input:
@@ -134,7 +132,7 @@ rule bwa:
         index = expand('output/020_bwa/honeybee_ref.fasta.{suffix}',
                        suffix=['amb', 'ann', 'bwt', 'pac', 'sa'])
     output:
-        'output/020_bwa/{indiv}.sam'
+        temp('output/020_bwa/{indiv}.sam')
     params:
         prefix = 'output/020_bwa/honeybee_ref.fasta',
         rg = '\'@RG\\tID:{indiv}\\tSM:{indiv}\''
@@ -174,8 +172,6 @@ rule index:
         '-p {params.prefix} '
         '{input} '
         '2> {log}'
-
-
 
 rule trim_decon:
     input:
