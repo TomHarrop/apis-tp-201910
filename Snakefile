@@ -13,13 +13,13 @@ honeybee_ref = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.fna'
 
 # containers
 bbduk_container = 'shub://TomHarrop/singularity-containers:bbmap_38.00'
-freebayes_container = 'shub://TomHarrop/singularity-containers:freebayes_1.2.0'
+bioconductor_container = 'shub://TomHarrop/singularity-containers:bioconductor_3.9'
 bwa_container = 'shub://TomHarrop/singularity-containers:bwa_0.7.17'
+freebayes_container = 'shub://TomHarrop/singularity-containers:freebayes_1.2.0'
+pigz_container = 'shub://TomHarrop/singularity-containers:pigz_2.4.0'
+sambamba_container = 'shub://TomHarrop/singularity-containers:sambamba_0.6.9'
 samtools_container = 'shub://TomHarrop/singularity-containers:samtools_1.9'
 vcflib_container = 'shub://TomHarrop/singularity-containers:vcflib_1.0.0-rc2'
-bioconductor_container = 'shub://TomHarrop/singularity-containers:bioconductor_3.9'
-pigz_container = 'shub://TomHarrop/singularity-containers:pigz_2.4.0'
-
 
 ########
 # MAIN #
@@ -35,23 +35,64 @@ all_indivs = sorted(set(
 
 rule target:
     input:
-        'output/040_freebayes/variants_filtered.vcf'
+        'output/050_variant-annotation/csd.vcf',
+        'output/030_process-aln/merged.bam'
 
-rule filter_vcf:
+rule extract_derived_cds:
     input:
-        'output/040_freebayes/variants.vcf'
+        fa = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.fna',
+        regions = 'output/050_variant-annotation/csd_regions.txt',
+        vcf = 'output/050_variant-annotation/csd_reheadered.vcf'
     output:
-        'output/040_freebayes/variants_filtered.vcf'
+        temp('output/060_derived-alleles/{indiv}-consensus.fa')
+    log:
+        'output/logs/060_derived-alleles/{indiv}-consensus.log'
+    singularity:
+        samtools_container
+    shell:
+        'samtools faidx '
+        '{input.fa} '
+        '$(cat {input.regions}) '
+        '2> {log} '
+        '| '
+        'bcftools consensus '
+        '-s {wildcards.indiv} '
+        '-H 1 '
+        '{input.vcf} '
+        '> {output} '
+        '2>> {log}'
+
+rule filter_csd_variants:
+    input:
+        gff = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.gff',
+        vcf = 'output/040_freebayes/variants_csd_filtered.vcf.gz',
+        tbi = 'output/040_freebayes/variants_csd_filtered.vcf.gz.tbi',
+        fa = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.fna',
+    output:
+        coding = 'output/050_variant-annotation/coding.Rds',
+        csd = 'output/050_variant-annotation/csd.vcf',
+    log:
+        'output/logs/050_variant-annotation/filter_csd_variants.log'
+    singularity:
+        bioconductor_container
+    script:
+        'src/filter_csd_variants.R'
+
+rule filter_vcf_csd:
+    input:
+        'output/040_freebayes/variants_csd.vcf'
+    output:
+        'output/040_freebayes/variants_csd_filtered.vcf'
     params:
         filter = 'QUAL > 20'
     log:
-        'output/logs/040_freebayes/freebayes_filter.log'
+        'output/logs/040_freebayes/freebayes_filter_csd.log'
     singularity:
         vcflib_container
     shell:
         'vcffilter -f \'{params.filter}\' {input} > {output} 2> {log}'
 
-rule freebayes:
+rule freebayes_csd:
     input:
         bam = expand('output/030_process-aln/{indiv}_marked.bam',
                      indiv=all_indivs),
@@ -59,9 +100,10 @@ rule freebayes:
                      indiv=all_indivs),
         fa = honeybee_ref
     output:
-        vcf = 'output/040_freebayes/variants.vcf'
+        vcf = 'output/040_freebayes/variants_csd.vcf'
     params:
-        ploidy = '2'
+        ploidy = '2',
+        region = 'NC_037640.1:11771679-11781139'
     log:
         'output/logs/040_freebayes/freebayes.log'
     singularity:
@@ -69,10 +111,35 @@ rule freebayes:
     shell:
         'freebayes '
         '--ploidy {params.ploidy} '
+        '--region {params.region} '
         '-f {input.fa} '
         '{input.bam} '
         '> {output} '
         '2> {log}'
+
+
+rule merge_bam: # for visualisation
+    input:
+        expand('output/030_process-aln/{indiv}_marked.bam',
+               indiv=all_indivs)
+    output:
+        'output/030_process-aln/merged.bam'
+    log:
+        'output/logs/030_process-aln/merge.log'
+    threads:
+        multiprocessing.cpu_count()
+    singularity:
+        sambamba_container
+    shell:
+        'sambamba merge '
+        '--nthreads={threads} '
+        '--compression-level=9 '
+        '{output} '
+        '{input} '
+        '2> {log} '
+        '; '
+        'sambamba index {output} 2>> {log}'
+
 
 rule index_bamfile:
     input:
@@ -225,3 +292,47 @@ rule trim_decon:
         'in=stdin.fastq '
         'out={output.fq} '
         '2> {log.repair2} '
+
+# generic csd rules
+rule extract_csd_regions:
+    input:
+        gff = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.gff'
+    output:
+        regions = 'output/050_variant-annotation/csd_regions.txt'
+    log:
+        'output/logs/050_variant-annotation/extract_csd_regions.log'
+    singularity:
+        bioconductor_container
+    script:
+        'src/extract_csd_regions.R'
+
+
+# generic index rule
+rule index_vcf:
+    input:
+        'output/{folder}/{file}.vcf'
+    output:
+        gz = 'output/{folder}/{file}.vcf.gz',
+        tbi = 'output/{folder}/{file}.vcf.gz.tbi'
+    log:
+        'output/logs/{folder}/{file}_index-vcf.log'
+    singularity:
+        samtools_container
+    shell:
+        'bgzip -c {input} > {output.gz} 2> {log} '
+        '; '
+        'tabix -p vcf {output.gz} 2>> {log}'
+
+# generic reheader rule
+rule reheader_vcf:
+    input:
+        'output/{folder}/{file}.vcf'
+    output:
+        'output/{folder}/{file}_reheadered.vcf'
+    singularity:
+        samtools_container
+    shell:
+        'grep -v "^##FILTER=All filters passed" {input} > {output}'
+
+
+
