@@ -14,12 +14,18 @@ honeybee_ref = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.fna'
 # containers
 bbduk_container = 'shub://TomHarrop/singularity-containers:bbmap_38.00'
 bioconductor_container = 'shub://TomHarrop/singularity-containers:bioconductor_3.9'
+biopython_container = 'shub://TomHarrop/singularity-containers:biopython_1.73'
 bwa_container = 'shub://TomHarrop/singularity-containers:bwa_0.7.17'
+clustalo = 'shub://TomHarrop/singularity-containers:clustalo_1.2.4'
 freebayes_container = 'shub://TomHarrop/singularity-containers:freebayes_1.2.0'
 pigz_container = 'shub://TomHarrop/singularity-containers:pigz_2.4.0'
 sambamba_container = 'shub://TomHarrop/singularity-containers:sambamba_0.6.9'
 samtools_container = 'shub://TomHarrop/singularity-containers:samtools_1.9'
 vcflib_container = 'shub://TomHarrop/singularity-containers:vcflib_1.0.0-rc2'
+honeybee_genotype_pipeline = (
+    'shub://TomHarrop/'
+    'honeybee-genotype-pipeline:honeybee_genotype_pipeline_v0.0.2'
+    '@0726020591078c43cd45c1e0d138928d3dc197ce')
 
 ########
 # MAIN #
@@ -35,14 +41,96 @@ all_indivs = sorted(set(
 
 rule target:
     input:
-        'output/050_variant-annotation/csd.vcf',
-        'output/030_process-aln/merged.bam'
+        # 'output/050_variant-annotation/csd.vcf',
+        # 'output/030_process-aln/merged.bam',
+        # 'output/060_derived-alleles/all-indivs_aa.fa',
+        # 'output/060_derived-alleles/all-indivs_aa.faa',
+        # 'output/060_derived-alleles/drones_aa.f
+        'pipeline-output/010_genotypes/040_stats/ldepth.mean_cutoffs.csv'
+
+rule align_consensus:
+    input:
+        'output/060_derived-alleles/all-indivs_aa.fa'
+    output:
+        aln = 'output/060_derived-alleles/all-indivs_aa.faa',
+        dist = 'output/060_derived-alleles/all-indivs_aa.dist'
+    log:
+        'output/logs/060_derived-alleles/clustalo.fa'
+    threads:
+        multiprocessing.cpu_count()
+    singularity:
+        clustalo
+    shell:
+        'clustalo '
+        '-i {input} '
+        '--threads {threads} '
+        '--dealign '
+        '--full '
+        '--out {output.aln} '
+        '--distmat-out {output.dist} '
+        '&> {log}'
+
+rule drones_only:
+    input:
+        'output/060_derived-alleles/all-indivs_aa.fa'
+    output:
+        'output/060_derived-alleles/drones_aa.fa'
+    log:
+        'output/logs/060_derived-alleles/filterbyname.log'
+    threads:
+        1
+    singularity:
+        bbduk_container
+    shell:
+        'filterbyname.sh '
+        'in={input} '
+        'out={output} '
+        'names=DR '
+        'substring=name '
+        'include=t '
+        'ignorejunk=t '
+        '2> {log}'
+
+rule translate_consensus:
+    input:
+        'output/060_derived-alleles/consensus_all-indivs.fa'
+    output:
+        'output/060_derived-alleles/all-indivs_aa.fa'
+    singularity:
+        biopython_container
+    script:
+        'src/translate_consensus.py'
+
+rule combine_cds:
+    input:
+        expand('output/060_derived-alleles/{indiv}_consensus_condensed.fa',
+               indiv=all_indivs)
+    output:
+        'output/060_derived-alleles/consensus_all-indivs.fa'
+    singularity:
+        samtools_container
+    shell:
+        'cat {input} > {output}'
+
+rule condense_cds:
+    input:
+        'output/060_derived-alleles/{indiv}-consensus.fa'
+    output:
+        temp('output/060_derived-alleles/{indiv}_consensus_condensed.fa')
+    params:
+        header = '>{indiv}'
+    singularity:
+        samtools_container
+    shell:
+        'echo "{params.header}" > {output} ; '
+        'grep -v "^>" {input} >> {output}'
+
 
 rule extract_derived_cds:
     input:
         fa = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.fna',
-        regions = 'output/050_variant-annotation/csd_regions.txt',
-        vcf = 'output/050_variant-annotation/csd_reheadered.vcf'
+        regions = 'output/050_variant-annotation/hvr_dt.txt',
+        vcf = 'output/050_variant-annotation/csd_reheadered.vcf.gz'
     output:
         temp('output/060_derived-alleles/{indiv}-consensus.fa')
     log:
@@ -294,18 +382,17 @@ rule trim_decon:
         '2> {log.repair2} '
 
 # generic csd rules
-rule extract_csd_regions:
+rule extract_hvr_exon:
     input:
         gff = 'data/GCF_003254395.2_Amel_HAv3.1_genomic.gff'
     output:
-        regions = 'output/050_variant-annotation/csd_regions.txt'
+        regions = 'output/050_variant-annotation/hvr_dt.txt'
     log:
-        'output/logs/050_variant-annotation/extract_csd_regions.log'
+        'output/logs/050_variant-annotation/extract_hvr_exon.log'
     singularity:
         bioconductor_container
     script:
-        'src/extract_csd_regions.R'
-
+        'src/extract_hvr_exon.R'
 
 # generic index rule
 rule index_vcf:
@@ -334,5 +421,31 @@ rule reheader_vcf:
     shell:
         'grep -v "^##FILTER=All filters passed" {input} > {output}'
 
+
+# try the pipeline
+rule genotype:
+    input:
+        csv = 'data/ty_samples.csv',
+        ref = honeybee_ref
+    output:
+        'pipeline-output/010_genotypes/040_stats/ldepth.mean_cutoffs.csv'
+    params:
+        wd = 'pipeline-output/010_genotypes',
+        ploidy = '2'
+    log:
+        'pipeline-output/logs/genotype.log'
+    threads:
+        multiprocessing.cpu_count()
+    singularity:
+        honeybee_genotype_pipeline
+    shell:
+        'honeybee_genotype_pipeline '
+        '--ref {input.ref} '
+        '--samples_csv {input.csv} '
+        '--outdir {params.wd} '
+        '--ploidy {params.ploidy} '
+        '--threads {threads} '
+        '--restart_times 1 '
+        '&> {log}'
 
 
