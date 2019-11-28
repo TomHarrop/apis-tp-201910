@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 
 import multiprocessing
+import pandas
+
+
+def get_min_cutoff(wildcards):
+    cutoff_file = checkpoints.genotype.get(**wildcards).output['cutoffs']
+    cutoffs = pandas.read_csv(cutoff_file,
+                              header=None,
+                              index_col=0)
+    return cutoffs.loc['min_depth', 1]
+
+
+def get_max_cutoff(wildcards):
+    cutoff_file = checkpoints.genotype.get(**wildcards).output['cutoffs']
+    cutoffs = pandas.read_csv(cutoff_file,
+                              header=None,
+                              index_col=0)
+    return cutoffs.loc['max_depth', 1]
 
 
 ###########
@@ -26,6 +43,9 @@ honeybee_genotype_pipeline = (
     'shub://TomHarrop/'
     'honeybee-genotype-pipeline:honeybee_genotype_pipeline_v0.0.2'
     '@0726020591078c43cd45c1e0d138928d3dc197ce')
+vcftools = ('shub://TomHarrop/variant-utils:vcftools_0.1.16'
+            '@d64cc5a37951760be575c43024c66e69b2563166')
+whatshap = 'shub://TomHarrop/variant-utils:whatshap_0.18'
 
 ########
 # MAIN #
@@ -46,7 +66,7 @@ rule target:
         # 'output/060_derived-alleles/all-indivs_aa.fa',
         # 'output/060_derived-alleles/all-indivs_aa.faa',
         # 'output/060_derived-alleles/drones_aa.f
-        'pipeline-output/010_genotypes/040_stats/ldepth.mean_cutoffs.csv'
+        'output/030_phased/phased.vcf.gz'
 
 rule align_consensus:
     input:
@@ -180,206 +200,90 @@ rule filter_vcf_csd:
     shell:
         'vcffilter -f \'{params.filter}\' {input} > {output} 2> {log}'
 
-rule freebayes_csd:
+
+rule phase:
     input:
-        bam = expand('output/030_process-aln/{indiv}_marked.bam',
-                     indiv=all_indivs),
-        bai = expand('output/030_process-aln/{indiv}_marked.bam.bai',
-                     indiv=all_indivs),
-        fa = honeybee_ref
+        vcf = 'output/020_filtered-genotypes/filtered.vcf.gz',
+        bam = 'output/010_genotypes/merged.bam',
+        ref = 'output/010_genotypes/015_ref/ref.fasta',
+        fai = 'output/010_genotypes/015_ref/ref.fasta.fai',
     output:
-        vcf = 'output/040_freebayes/variants_csd.vcf'
-    params:
-        ploidy = '2',
-        region = 'NC_037640.1:11771679-11781139'
+        'output/030_phased/phased.vcf'
     log:
-        'output/logs/040_freebayes/freebayes.log'
+        'output/logs/030_phase.log'
     singularity:
-        freebayes_container
+        whatshap
     shell:
-        'freebayes '
-        '--ploidy {params.ploidy} '
-        '--region {params.region} '
-        '-f {input.fa} '
+        'whatshap phase '
+        '--reference {input.ref} '
+        '-o {output} '
+        '--indels '
+        '{input.vcf} '
         '{input.bam} '
+        '&> {log}'
+
+
+rule filter:
+    input:
+        cutoffs = 'output/010_genotypes/040_stats/ldepth.mean_cutoffs.csv',
+        vcf = 'output/010_genotypes/calls.vcf.gz'
+    output:
+        'output/020_filtered-genotypes/filtered.vcf'
+    params:
+        min_depth = get_min_cutoff,
+        max_depth = get_max_cutoff,
+        maf = 0.1,
+        max_missing = 0.9,
+        qual = 30
+    log:
+        'output/logs/020_filter.log'
+    singularity:
+        vcftools
+    shell:
+        'vcftools '
+        '--gzvcf {input.vcf} '
+        '--maf {params.maf} '
+        '--max-missing {params.max_missing} '
+        '--minQ {params.qual} '
+        '--min-meanDP {params.min_depth} '
+        '--max-meanDP {params.max_depth} '
+        '--minDP {params.min_depth} '
+        '--maxDP {params.max_depth} '
+        '--recode '
+        '--stdout '
         '> {output} '
         '2> {log}'
 
 
-rule merge_bam: # for visualisation
+# try the pipeline
+checkpoint genotype:
     input:
-        expand('output/030_process-aln/{indiv}_marked.bam',
-               indiv=all_indivs)
+        csv = 'data/ty_samples.csv',
+        ref = honeybee_ref
     output:
-        'output/030_process-aln/merged.bam'
-    log:
-        'output/logs/030_process-aln/merge.log'
-    threads:
-        multiprocessing.cpu_count()
-    singularity:
-        sambamba_container
-    shell:
-        'sambamba merge '
-        '--nthreads={threads} '
-        '--compression-level=9 '
-        '{output} '
-        '{input} '
-        '2> {log} '
-        '; '
-        'sambamba index {output} 2>> {log}'
-
-
-rule index_bamfile:
-    input:
-        'output/030_process-aln/{indiv}_marked.bam'
-    output:
-        'output/030_process-aln/{indiv}_marked.bam.bai'
-    log:
-        'output/logs/030_process-aln/{indiv}_index.log',
-    threads:
-        2
-    singularity:
-        samtools_container
-    shell:
-        'samtools index -@ {threads} {input} 2> {log}'
-
-rule markdup:
-    input:
-        'output/020_bwa/{indiv}.sam'
-    output:
-        sorted = temp('output/030_process-aln/{indiv}_sorted.bam'),
-        marked = 'output/030_process-aln/{indiv}_marked.bam'
-    threads:
-        multiprocessing.cpu_count()
-    log:
-        s = 'output/logs/030_process-aln/{indiv}_sort.log',
-        m = 'output/logs/030_process-aln/{indiv}_markdup.log'
-    singularity:
-        samtools_container
-    shell:
-        'samtools fixmate '
-        '-m '
-        '-O BAM '
-        '-@ {threads} '
-        '{input} '
-        '- '
-        '2> {log.s} '
-        '| '
-        'samtools sort '
-        '-o {output.sorted} '
-        '-O BAM '
-        '-l 0 '
-        '-@ {threads} '
-        '- '
-        '2>> {log.s} '
-        '; '
-        'samtools markdup '
-        '-@ {threads} '
-        '-s '
-        '{output.sorted} '
-        '{output.marked} '
-        '2> {log.m}'
-
-# map individuals
-rule bwa:
-    input:
-        fq = 'output/010_trim-decon/{indiv}.fq.gz',
-        index = expand('output/020_bwa/honeybee_ref.fasta.{suffix}',
-                       suffix=['amb', 'ann', 'bwt', 'pac', 'sa'])
-    output:
-        temp('output/020_bwa/{indiv}.sam')
+        cutoffs = 'output/010_genotypes/040_stats/ldepth.mean_cutoffs.csv',
+        vcf = 'output/010_genotypes/calls.vcf.gz',
+        bam = 'output/010_genotypes/merged.bam',
+        ref = 'output/010_genotypes/015_ref/ref.fasta',
+        fai = 'output/010_genotypes/015_ref/ref.fasta.fai',
     params:
-        prefix = 'output/020_bwa/honeybee_ref.fasta',
-        rg = '\'@RG\\tID:{indiv}\\tSM:{indiv}\''
-    threads:
-        multiprocessing.cpu_count()
+        wd = 'output/010_genotypes',
+        ploidy = '2'
     log:
-        'output/logs/020_bwa/{indiv}.log'
-    singularity:
-        bwa_container
-    shell:
-        'bwa mem '
-        '-t {threads} '
-        '-p '
-        '-R {params.rg} '
-        '{params.prefix} '
-        '{input.fq} '
-        '> {output} '
-        '2> {log}'
-
-# prepare ref
-rule index:
-    input:
-        honeybee_ref
-    output:
-        expand('output/020_bwa/honeybee_ref.fasta.{suffix}',
-               suffix=['amb', 'ann', 'bwt', 'pac', 'sa'])
-    params:
-        prefix = 'output/020_bwa/honeybee_ref.fasta'
-    threads:
-        1
-    log:
-        'output/logs/020_bwa/index.log'
-    singularity:
-        bwa_container
-    shell:
-        'bwa index '
-        '-p {params.prefix} '
-        '{input} '
-        '2> {log}'
-
-rule trim_decon:
-    input:
-        r1 = 'data/raw/{indiv}/{indiv}_R1.fq.gz',
-        r2 = 'data/raw/{indiv}/{indiv}_R2.fq.gz'
-    output:
-        fq = 'output/010_trim-decon/{indiv}.fq.gz',
-        f_stats = 'output/010_trim-decon/{indiv}_filter-stats.txt',
-        t_stats = 'output/010_trim-decon/{indiv}_trim-stats.txt'
-    log:
-        filter = 'output/logs/010_trim-decon/{indiv}_filter.log',
-        trim = 'output/logs/010_trim-decon/{indiv}_trim.log',
-        repair1 = 'output/logs/010_trim-decon/{indiv}_repair1.log',
-        repair2 = 'output/logs/010_trim-decon/{indiv}_repair2.log'
-    params:
-        filter = bbduk_ref,
-        trim = bbduk_adaptors
+        'output/logs/genotype.log'
     threads:
         multiprocessing.cpu_count()
     singularity:
-        bbduk_container
+        honeybee_genotype_pipeline
     shell:
-        'repair.sh '
-        'in={input.r1} '
-        'in2={input.r2} '
-        'out=stdout.fastq '
-        '2> {log.repair1} '
-        '| '
-        'bbduk.sh '
-        'threads={threads} '
-        'in=stdin.fastq '
-        'int=t '
-        'out=stdout.fastq '
-        'ref={params.filter} '
-        'hdist=1 '
-        'stats={output.f_stats} '
-        '2> {log.filter} '
-        '| '
-        'bbduk.sh '
-        'threads={threads} '
-        'in=stdin.fastq '
-        'int=t '
-        'out=stdout.fastq '
-        'ref={params.trim} '
-        'ktrim=r k=23 mink=11 hdist=1 tpe tbo '
-        'forcetrimmod=5 '
-        'stats={output.t_stats} '
-        '2> {log.trim} '
-        '| '
-        'repair.sh '
-        'in=stdin.fastq '
-        'out={output.fq} '
-        '2> {log.repair2} '
+        'honeybee_genotype_pipeline '
+        '--ref {input.ref} '
+        '--samples_csv {input.csv} '
+        '--outdir {params.wd} '
+        '--ploidy {params.ploidy} '
+        '--threads {threads} '
+        '--restart_times 1 '
+        '&> {log}'
 
 # generic csd rules
 rule extract_hvr_exon:
@@ -420,32 +324,4 @@ rule reheader_vcf:
         samtools_container
     shell:
         'grep -v "^##FILTER=All filters passed" {input} > {output}'
-
-
-# try the pipeline
-rule genotype:
-    input:
-        csv = 'data/ty_samples.csv',
-        ref = honeybee_ref
-    output:
-        'pipeline-output/010_genotypes/040_stats/ldepth.mean_cutoffs.csv'
-    params:
-        wd = 'pipeline-output/010_genotypes',
-        ploidy = '2'
-    log:
-        'pipeline-output/logs/genotype.log'
-    threads:
-        multiprocessing.cpu_count()
-    singularity:
-        honeybee_genotype_pipeline
-    shell:
-        'honeybee_genotype_pipeline '
-        '--ref {input.ref} '
-        '--samples_csv {input.csv} '
-        '--outdir {params.wd} '
-        '--ploidy {params.ploidy} '
-        '--threads {threads} '
-        '--restart_times 1 '
-        '&> {log}'
-
 
